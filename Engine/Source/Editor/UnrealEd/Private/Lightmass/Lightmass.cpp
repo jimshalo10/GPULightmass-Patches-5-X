@@ -54,10 +54,82 @@
 #include "Modules/ModuleManager.h"
 #include "ImageCoreUtils.h"
 #include "Misc/FileHelper.h"
+#include "StaticLightingBuildContext.h"
+#include "Engine/InstancedStaticMesh.h"
+#include "JsonObjectConverter.h"
 
 extern FSwarmDebugOptions GSwarmDebugOptions;
 
-bool Lightmass_IsSubstrateEnabled();
+//@todo_ow: Potentially move to core for sharing ?
+class FObjectMemoryWriter : public  FMemoryWriter 
+{
+public:
+	FObjectMemoryWriter(TArray<uint8>& Payload) : 
+		FMemoryWriter(Payload)
+	{
+	}
+
+	virtual FArchive& operator<<(struct FSoftObjectPath& Value)
+	{
+		FString FullPath = Value.ToString();
+		*this << FullPath;
+
+		return *this;
+	}
+};
+
+class FObjectMemoryReader : public  FMemoryReader
+{
+public:
+	FObjectMemoryReader(TArray<uint8>& Payload) :
+		FMemoryReader(Payload)
+	{
+	}
+
+	virtual FArchive& operator<<(struct FSoftObjectPath& Value)
+	{
+		FString FullPath;
+		*this << FullPath;
+		Value = FSoftObjectPath(FullPath);
+
+		return *this;
+	}
+};
+
+struct FDeferredMappingsBundle
+{
+	// Map of all external GUIDs to internal mapping GUID in this bundle 
+	// This is used to map the owners actors to the mappings
+	TMap<FGuid, FGuid> OwnerToMapping;
+	TMap<FGuid, const FLightmassProcessor::FTextureMappingImportHelper*> MappingGuidToHelper;
+	TArray<FLightmassProcessor::FTextureMappingImportHelper> Mappings;
+	
+	void Serialize(FArchive& Ar, bool bManifestOnly)
+	{
+		Ar << OwnerToMapping;
+		
+		if (!bManifestOnly)
+		{
+			Ar << Mappings;
+		}
+
+	}
+
+	void MapHelpers()
+	{
+		MappingGuidToHelper.Reset();
+		OwnerToMapping.Reset();
+
+		for (const FLightmassProcessor::FTextureMappingImportHelper& Helper : Mappings)
+		{
+			MappingGuidToHelper.Add(Helper.MappingGuid, &Helper);
+			OwnerToMapping.Add(Helper.OwnerGuid, Helper.MappingGuid);
+		}
+	}
+};
+
+
+
 
 DEFINE_LOG_CATEGORY_STATIC(LogLightmassSolver, Warning, All);
 /**
@@ -89,8 +161,7 @@ void FSwarmDebugOptions::Touch()
 
 #include "ImportExport.h"
 #include "MaterialExport.h"
-#include "StatsViewerModule.h"
-#include "LightingBuildInfo.h"
+#include "IStatsViewerProvider.h"
 #include "Logging/TokenizedMessage.h"
 #include "Logging/MessageLog.h"
 #include "Misc/UObjectToken.h"
@@ -138,7 +209,7 @@ void VerifyLightmassIni(const ANSICHAR* Code,const ANSICHAR* Filename,uint32 Lin
 {
 	if (FApp::IsUnattended())
 	{
-		UE_LOG(LogLightmassSolver, Fatal,TEXT("%s failed \n at %s:%u"),ANSI_TO_TCHAR(Code),ANSI_TO_TCHAR(Filename),Line);
+		UE_LOGF(LogLightmassSolver, Fatal,"%ls failed \n at %ls:%u",ANSI_TO_TCHAR(Code),ANSI_TO_TCHAR(Filename),Line);
 	}
 	else
 	{
@@ -487,13 +558,14 @@ void FLightmassProcessor::SwarmCallback( NSwarm::FMessage* CallbackMessage, void
 /*-----------------------------------------------------------------------------
 	FLightmassExporter
 -----------------------------------------------------------------------------*/
-FLightmassExporter::FLightmassExporter( UWorld* InWorld )
+FLightmassExporter::FLightmassExporter(const FStaticLightingBuildContext& Context)
 	: Swarm( NSwarm::FSwarmInterface::Get() ) 
 	, SkyAtmosphereComponent(nullptr)
 	, ExportStage(NotRunning)
 	, CurrentAmortizationIndex(0)
 	, OpenedMaterialExportChannels()
-	, World( InWorld )
+	, World( Context.World )
+	, LightingContext(Context)
 {
 	// We must have a valid world
 	check( World );
@@ -543,7 +615,7 @@ void FLightmassExporter::AddMaterial(UMaterialInterface* InMaterialInterface, co
 
 		if (auto* ExistingExportSettings = MaterialExportSettings.Find(InMaterialInterface))
 		{
-			checkf(ExportSettings == *ExistingExportSettings, TEXT("Attempting to add the same material twice with different export settings, this is not (currently) supported"));
+			ensureMsgf(ExportSettings == *ExistingExportSettings, TEXT("Attempting to add the same material twice with different export settings, this is not (currently) supported"));
 			return;
 		}
 
@@ -594,6 +666,15 @@ const FStaticLightingMapping* FLightmassExporter::FindMappingByGuid(FGuid FindGu
 		}
 	}
 
+	for( int32 MappingIdx=0; MappingIdx < LandscapeVolumeMappings.Num(); MappingIdx++ )
+	{
+		const FStaticLightingMapping* CurrentMapping = LandscapeVolumeMappings[MappingIdx];
+		if (CurrentMapping->GetLightingGuid() == FindGuid)
+		{
+			return CurrentMapping;
+		}
+	}
+
 	return NULL;
 }
 
@@ -613,7 +694,7 @@ void FLightmassExporter::WriteToChannel( FLightmassStatistics& Stats, FGuid& Deb
 				DirectionalLights.Num() + PointLights.Num() + SpotLights.Num() + RectLights.Num() + SkyLights.Num() + 
 				StaticMeshes.Num() + StaticMeshLightingMeshes.Num() + StaticMeshTextureMappings.Num() + 
 				BSPSurfaceMappings.Num() + VolumeMappings.Num() + Materials.Num() + 
-				+ LandscapeLightingMeshes.Num() + LandscapeTextureMappings.Num();
+				+ LandscapeLightingMeshes.Num() + LandscapeTextureMappings.Num() + LandscapeVolumeMappings.Num();
 
 			CurrentProgress = 0;
 
@@ -654,6 +735,7 @@ void FLightmassExporter::WriteToChannel( FLightmassStatistics& Stats, FGuid& Deb
 			Scene.NumLandscapeTextureMappings = LandscapeTextureMappings.Num();
 			Scene.NumSpeedTreeMappings = 0;
 			Scene.NumVolumeMappings = VolumeMappings.Num();
+			Scene.NumLandscapeVolumeMappings = LandscapeVolumeMappings.Num();
 			Scene.NumPrecomputedVisibilityBuckets = VisibilityBucketGuids.Num();
 			Scene.NumVolumetricLightmapTasks = VolumetricLightmapTaskGuids.Num();
 			Swarm.WriteChannel( Channel, &Scene, sizeof(Scene) );
@@ -721,7 +803,7 @@ void FLightmassExporter::WriteToChannel( FLightmassStatistics& Stats, FGuid& Deb
 		}
 		else
 		{
-			UE_LOG(LogLightmassSolver, Log,  TEXT("Error, OpenChannel failed to open %s with error code %d"), *ChannelName, Channel );
+			UE_LOGF(LogLightmassSolver, Log,  "Error, OpenChannel failed to open %ls with error code %d", *ChannelName, Channel );
 		}
 	}
 }
@@ -789,7 +871,7 @@ bool FLightmassExporter::WriteToMaterialChannel(FLightmassStatistics& Stats)
 					}
 				}
 				break;
-			default: UE_LOG(LogLightmassSolver, Fatal, TEXT("Invalid amortization stage hit."));
+			default: UE_LOGF(LogLightmassSolver, Fatal, "Invalid amortization stage hit.");
 			}
 		}
 
@@ -1332,7 +1414,7 @@ void FLightmassExporter::WriteStaticMeshes()
 			}
 			else
 			{
-				UE_LOG(LogLightmassSolver, Log,  TEXT("Error, OpenChannel failed to open %s with error code %d"), *NewChannelName, Channel );
+				UE_LOGF(LogLightmassSolver, Log,  "Error, OpenChannel failed to open %ls with error code %d", *NewChannelName, Channel );
 			}
 		}
 		UpdateExportProgress();
@@ -1357,9 +1439,9 @@ void FLightmassExporter::GetMaterialHash(const UMaterialInterface* Material, FSH
 		}
 	}
 
-	if (Lightmass_IsSubstrateEnabled())
+	if (Substrate::IsSubstrateEnabled())
 	{
-		uint32 LightmassSubstrateVersion = 0XB6A0D99F; // This can be change when the code/logic for converting material to Substrate for lightmap has changed.
+		uint32 LightmassSubstrateVersion = 0XFA1081D0; // This can be change when the code/logic for converting material to Substrate for lightmap has changed.
 		HashState.Update((const uint8*)&LightmassSubstrateVersion, sizeof(LightmassSubstrateVersion));
 	}
 
@@ -1402,7 +1484,7 @@ void FLightmassExporter::BuildMaterialMap(UMaterialInterface* Material)
 			}
 			else
 			{
-				UE_LOG(LogLightmassSolver, Warning, TEXT("Error in TestChannel() for %s: %s"), *(MaterialHash.ToString()), *(Material->GetPathName()));
+				UE_LOGF(LogLightmassSolver, Warning, "Error in TestChannel() for %ls: %ls", *(MaterialHash.ToString()), *(Material->GetPathName()));
 			}
 		}
 	}
@@ -1496,12 +1578,12 @@ void FLightmassExporter::ExportMaterial(UMaterialInterface* Material, const FLig
 			}
 			else
 			{
-				UE_LOG(LogLightmassSolver, Warning, TEXT("Failed to open channel for material data for %s: %s"), *(Material->GetLightingGuid().ToString()), *(Material->GetPathName()));
+				UE_LOGF(LogLightmassSolver, Warning, "Failed to open channel for material data for %ls: %ls", *(Material->GetLightingGuid().ToString()), *(Material->GetPathName()));
 			}
 		}
 		else
 		{
-			UE_LOG(LogLightmassSolver, Warning, TEXT("Failed to generate material data for %s: %s"), *(Material->GetLightingGuid().ToString()), *(Material->GetPathName()));
+			UE_LOGF(LogLightmassSolver, Warning, "Failed to generate material data for %ls: %ls", *(Material->GetLightingGuid().ToString()), *(Material->GetPathName()));
 		}
 	}
 		
@@ -1518,14 +1600,13 @@ void FLightmassExporter::WriteBaseMeshInstanceData( int32 Channel, int32 MeshInd
 	MeshInstanceData.NumVertices = Mesh->NumVertices;
 	MeshInstanceData.NumShadingVertices = Mesh->NumShadingVertices;
 	MeshInstanceData.MeshIndex = MeshIndex;
-	MeshInstanceData.LevelGuid = *LevelGuids.FindKey(World->PersistentLevel);
+	MeshInstanceData.LevelGuid = LightingContext.GetPersistentLevelGuid();
 	check(Mesh->Component);
 	bool bFoundLevel = false;
 	AActor* ComponentOwner = Mesh->Component->GetOwner();
 	if (ComponentOwner && ComponentOwner->GetLevel())
 	{
-		ULevel* MeshLevel = Mesh->Component->GetOwner()->GetLevel();
-		MeshInstanceData.LevelGuid = *LevelGuids.FindKey(MeshLevel);
+		MeshInstanceData.LevelGuid = LightingContext.GetLevelGuidForActor(ComponentOwner);
 		bFoundLevel = true;
 	}
 	else if (Mesh->Component->IsA(UModelComponent::StaticClass()))
@@ -1535,7 +1616,7 @@ void FLightmassExporter::WriteBaseMeshInstanceData( int32 Channel, int32 MeshInd
 		{
 			if (ModelComponent->GetModel() == World->GetLevel(LevelIndex)->Model)
 			{
-				MeshInstanceData.LevelGuid = *LevelGuids.FindKey(World->GetLevel(LevelIndex));
+				MeshInstanceData.LevelGuid = LightingContext.GetLevelGuidForLevel(World->GetLevel(LevelIndex));
 				bFoundLevel = true;
 				break;
 			}
@@ -1544,7 +1625,7 @@ void FLightmassExporter::WriteBaseMeshInstanceData( int32 Channel, int32 MeshInd
 	
 	if (!bFoundLevel)
 	{
-		UE_LOG(LogLightmassSolver, Warning, TEXT("Couldn't determine level for component %s during Lightmass export, it will be considered in the persistent level!"), *Mesh->Component->GetPathName());
+		UE_LOGF(LogLightmassSolver, Warning, "Couldn't determine level for component %ls during Lightmass export, it will be considered in the persistent level!", *Mesh->Component->GetPathName());
 	}
 
 	MeshInstanceData.LightingFlags = 0;
@@ -1552,17 +1633,16 @@ void FLightmassExporter::WriteBaseMeshInstanceData( int32 Channel, int32 MeshInd
 	MeshInstanceData.LightingFlags |= Mesh->bTwoSidedMaterial ? Lightmass::GI_INSTANCE_TWOSIDED : 0;
 	MeshInstanceData.bCastShadowAsTwoSided = Mesh->Component->bCastShadowAsTwoSided;
 	MeshInstanceData.bMovable = (Mesh->Component->Mobility != EComponentMobility::Static);
-	MeshInstanceData.NumRelevantLights = Mesh->RelevantLights.Num();
+	MeshInstanceData.NumRelevantLights = Mesh->RelevantLightsGuid.Num();
 	MeshInstanceData.BoundingBox = FBox3f(Mesh->BoundingBox);
 	Swarm.WriteChannel( Channel, &MeshInstanceData, sizeof(MeshInstanceData) );
-	const uint32 LightGuidsSize = Mesh->RelevantLights.Num() * sizeof(FGuid);
+	const uint32 LightGuidsSize = Mesh->RelevantLightsGuid.Num() * sizeof(FGuid);
 	if( LightGuidsSize > 0 )
 	{
 		FGuid* LightGuids = (FGuid*)FMemory::Malloc(LightGuidsSize);
-		for( int32 LightIdx=0; LightIdx < Mesh->RelevantLights.Num(); LightIdx++ )
+		for( int32 LightIdx=0; LightIdx < Mesh->RelevantLightsGuid.Num(); LightIdx++ )
 		{
-			const ULightComponent* Light = Mesh->RelevantLights[LightIdx];
-			LightGuids[LightIdx] = Light->LightGuid;
+			LightGuids[LightIdx] = Mesh->RelevantLightsGuid[LightIdx];
 		}
 		Swarm.WriteChannel( Channel, LightGuids, LightGuidsSize );
 		FMemory::Free( LightGuids );
@@ -1995,6 +2075,13 @@ void FLightmassExporter::WriteMappings( int32 Channel )
 		WriteBaseTextureMappingData( Channel, VolumeMapping );
 		UpdateExportProgress();
 	}
+
+	for (int32 MappingIdx = 0; MappingIdx < LandscapeVolumeMappings.Num(); MappingIdx++)
+	{
+		const FLandscapeStaticLightingGlobalVolumeMapping* VolumeMapping = LandscapeVolumeMappings[MappingIdx];
+		WriteLandscapeMapping( Channel, VolumeMapping );
+		UpdateExportProgress();
+	}
 }
 
 /** Finds the GUID of the mapping that is being debugged. */
@@ -2085,8 +2172,8 @@ void FLightmassExporter::SetVolumetricLightmapSettings(Lightmass::FVolumetricLig
 	const int32 MaxGridDimension = FMath::Pow(2048000000 / 4, 1.0f / 3) * OutSettings.BrickSize;
 	if (FullGridSize.GetMax() > MaxGridDimension)
 	{
-		UE_LOG(LogLightmassSolver, Warning, 
-			TEXT("Volumetric lightmap grid size is too large which can cause potential crashes or long build time, clamping from (%d, %d, %d) to (%d, %d, %d)"),
+		UE_LOGF(LogLightmassSolver, Warning, 
+			"Volumetric lightmap grid size is too large which can cause potential crashes or long build time, clamping from (%d, %d, %d) to (%d, %d, %d)",
 			FullGridSize.X,
 			FullGridSize.Y,
 			FullGridSize.Z,
@@ -2147,10 +2234,10 @@ void FLightmassExporter::WriteSceneSettings( Lightmass::FSceneFileHeader& Scene 
 		int32 CheckQualityLevel;
 		GConfig->GetInt( TEXT("LightingBuildOptions"), TEXT("QualityLevel"), CheckQualityLevel, GEditorPerProjectIni);
 		CheckQualityLevel = FMath::Clamp<int32>(CheckQualityLevel, Quality_Preview, Quality_Production);
-		UE_LOG(LogLightmassSolver, Log, TEXT("LIGHTMASS: Writing scene settings: Quality level %d (%d in INI)"), (int32)(QualityLevel), CheckQualityLevel);
+		UE_LOGF(LogLightmassSolver, Log, "LIGHTMASS: Writing scene settings: Quality level %d (%d in INI)", (int32)(QualityLevel), CheckQualityLevel);
 		if (CheckQualityLevel != QualityLevel)
 		{
-			UE_LOG(LogLightmassSolver, Warning, TEXT("LIGHTMASS: Writing scene settings w/ QualityLevel mismatch! %d vs %d (ini setting)"), (int32)QualityLevel, CheckQualityLevel);
+			UE_LOGF(LogLightmassSolver, Warning, "LIGHTMASS: Writing scene settings w/ QualityLevel mismatch! %d vs %d (ini setting)", (int32)QualityLevel, CheckQualityLevel);
 		}
 
 		switch (QualityLevel)
@@ -2546,7 +2633,7 @@ void FLightmassExporter::WriteDebugInput( Lightmass::FDebugLightingInputData& In
 					}
 					else if (DebugVisibilityId != Component->VisibilityId)
 					{
-						UE_LOG(LogLightmassSolver, Warning, TEXT("Not debugging visibility for component %s with vis id %u, as it was not the first component on the selected actor."),
+						UE_LOGF(LogLightmassSolver, Warning, "Not debugging visibility for component %ls with vis id %u, as it was not the first component on the selected actor.",
 							*Component->GetPathName(), Component->VisibilityId);
 					}
 				}
@@ -2573,7 +2660,7 @@ void FLightmassExporter::WriteDebugInput( Lightmass::FDebugLightingInputData& In
 							}
 							else if (DebugVisibilityId != SomeModelComponent->VisibilityId)
 							{
-								UE_LOG(LogLightmassSolver, Warning, TEXT("Not debugging visibility for model component %s with vis id %u!"),
+								UE_LOGF(LogLightmassSolver, Warning, "Not debugging visibility for model component %ls with vis id %u!",
 									*SomeModelComponent->GetPathName(), SomeModelComponent->VisibilityId);
 							}
 						}
@@ -2665,9 +2752,11 @@ FLightmassProcessor::FLightmassProcessor(const FStaticLightingSystem& InSystem, 
 	OptionsFolder = IFileManager::Get().ConvertToAbsolutePathForExternalAppForRead(*OptionsFolder);
 	int32 ConnectionHandle = Swarm.OpenConnection( SwarmCallback, this,  LogFlags, *OptionsFolder );
 	bSwarmConnectionIsValid = (ConnectionHandle >= 0);
-	Exporter = new FLightmassExporter( System.GetWorld() );
+	Exporter = new FLightmassExporter( System.GetLightingContext() );
 	check(Exporter);
 	Exporter->bSwarmConnectionIsValid = bSwarmConnectionIsValid;
+
+	DeferredMappingsDirectory = InSystem.Options.MappingsDirectory;
 
 	Messages.Add( TEXT("UseErrorColoringButton_Tooltip"), LOCTEXT("UseErrorColoringButton_Tooltip", "Display objects with lighting errors in identifying colors rather than black (Lightmass only).") );
 	Messages.Add( TEXT("LightmassError_SupportFP"), LOCTEXT("LightmassError_SupportFP", "Lightmass requires a graphics card with support for floating point rendertargets. Aborting!") );
@@ -2699,8 +2788,9 @@ FLightmassProcessor::~FLightmassProcessor()
 	}
 	ImportedMappings.Empty();
 
+	delete DeferredMappings;
+
 	FLandscapeStaticLightingMesh::LandscapeUpscaleHeightDataCache.Empty();
-	FLandscapeStaticLightingMesh::LandscapeUpscaleXYOffsetDataCache.Empty();
 }
 
 /** Retrieve an exporter for the given channel name */
@@ -2744,7 +2834,7 @@ bool FLightmassProcessor::OpenJob()
 	int32 ErrorCode = Swarm.OpenJob( Exporter->SceneGuid );
 	if( ErrorCode < 0 )
 	{
-		UE_LOG(LogLightmassSolver, Log,  TEXT("Error, OpenJob failed with error code %d"), ErrorCode );
+		UE_LOGF(LogLightmassSolver, Log,  "Error, OpenJob failed with error code %d", ErrorCode );
 		return false;
 	}
 	return true;
@@ -2756,7 +2846,7 @@ bool FLightmassProcessor::CloseJob()
 	int32 ErrorCode = Swarm.CloseJob();
 	if( ErrorCode < 0 )
 	{
-		UE_LOG(LogLightmassSolver, Log,  TEXT("Error, CloseJob failed with error code %d"), ErrorCode );
+		UE_LOGF(LogLightmassSolver, Log,  "Error, CloseJob failed with error code %d", ErrorCode );
 		return false;
 	}
 	return true;
@@ -2773,15 +2863,6 @@ void FLightmassProcessor::InitiateExport()
 	int32 NumCellDistributionBuckets;
 	VERIFYLIGHTMASSINI(GConfig->GetInt(TEXT("DevOptions.PrecomputedVisibility"), TEXT("NumCellDistributionBuckets"), NumCellDistributionBuckets, GLightmassIni));
 	
-	for ( int32 LevelIndex=0; LevelIndex < System.GetWorld()->GetNumLevels(); LevelIndex++ )
-	{
-		ULevel* Level = System.GetWorld()->GetLevel(LevelIndex);
-		FGuid LevelGuid = FGuid(0,0,0,LevelIndex);
-		Exporter->LevelGuids.Add(LevelGuid, Level);
-	}
-	auto FirstGuid = FGuid(0,0,0,0);
-	check(FindLevel(FirstGuid) == System.GetWorld()->PersistentLevel);
-
 	if (System.GetWorld()->GetWorldSettings()->bPrecomputeVisibility)
 	{
 		for (int32 DistributionBucketIndex = 0; DistributionBucketIndex < NumCellDistributionBuckets; DistributionBucketIndex++)
@@ -2791,7 +2872,8 @@ void FLightmassProcessor::InitiateExport()
 	}
 
 	if (System.GetWorld()->GetWorldSettings()->LightmassSettings.VolumeLightingMethod == VLM_VolumetricLightmap
-		&& !bOnlyBuildVisibility)
+		&& !bOnlyBuildVisibility 
+		&& !System.Options.bApplyDeferedActorMappingPass )
 	{
 		Lightmass::FVolumetricLightmapSettings VolumetricLightmapSettings;
 		GetLightmassExporter()->SetVolumetricLightmapSettings(VolumetricLightmapSettings);
@@ -2853,7 +2935,7 @@ void FLightmassProcessor::IssueStaticShadowDepthMapTask(const ULightComponent* L
 		}
 		else
 		{
-			UE_LOG(LogLightmassSolver, Warning,  TEXT("Error, AddTask for StaticShadowDepthMaps failed with error code %d"), ErrorCode );
+			UE_LOGF(LogLightmassSolver, Warning,  "Error, AddTask for StaticShadowDepthMaps failed with error code %d", ErrorCode );
 			bProcessingFailed = true;
 		}
 	}
@@ -2863,10 +2945,13 @@ void FLightmassProcessor::IssueStaticShadowDepthMapTask(const ULightComponent* L
 class FEngineDependencyPaths
 {
 public:
-	FEngineDependencyPaths(std::initializer_list<const TCHAR*> Paths)
+	FEngineDependencyPaths(std::initializer_list<const TCHAR*> Paths, const TArray<FString>& InDynamicDependencyPaths = TArray<FString>())
 	{
-		Strings.Reserve(Paths.size());
 		for(const TCHAR* Path : Paths)
+		{
+			Strings.Add(FPaths::EngineDir() / Path);
+		}
+		for(const FString& Path : InDynamicDependencyPaths)
 		{
 			Strings.Add(FPaths::EngineDir() / Path);
 		}
@@ -2893,6 +2978,39 @@ private:
 	TArray<const TCHAR*> RawStrings;
 };
 
+static TArray<FString> GetDynamicDependencyPathsFromManifest(const TCHAR* BinDir)
+{
+	TArray<FString> DynamicDependencyPaths;
+	FString FileData;
+	if (FFileHelper::LoadFileToString(FileData, *(FPaths::EngineDir() / BinDir / "UnrealLightmass.target")))
+	{
+		TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(FileData);
+		TSharedPtr<FJsonObject> RootJsonObject;
+		FJsonSerializer::Deserialize(Reader, RootJsonObject);
+		if (RootJsonObject)
+		{
+			const TArray<TSharedPtr<FJsonValue>>* BuildProducts = nullptr;
+			if (RootJsonObject->TryGetArrayField(TEXT("BuildProducts"), BuildProducts))
+			{
+				for (const auto& BuildProductField : *BuildProducts)
+				{
+					auto Obj = BuildProductField->AsObject();
+					FString TypeStr;
+					if (Obj && Obj->TryGetStringField(TEXT("Type"), TypeStr) && TypeStr == TEXT("DynamicLibrary"))
+					{
+						FString Tmp;
+						if (Obj->TryGetStringField(TEXT("Path"), Tmp) && Tmp.RemoveFromStart(TEXT("$(EngineDir)/")))
+						{
+							DynamicDependencyPaths.Emplace(Tmp);
+						}
+					}
+				}
+			}
+		}
+	}
+	return DynamicDependencyPaths;
+}
+
 bool FLightmassProcessor::BeginRun()
 {
 	{
@@ -2914,36 +3032,23 @@ bool FLightmassProcessor::BeginRun()
 	bool bUse64bitProcess = false;
 	bool bAllow64bitProcess = true;
 	VERIFYLIGHTMASSINI(GConfig->GetBool(TEXT("DevOptions.StaticLighting"), TEXT("bAllow64bitProcess"), bAllow64bitProcess, GLightmassIni));
-	if ( bAllow64bitProcess && FPlatformMisc::Is64bitOperatingSystem() )
+	if ( bAllow64bitProcess )
 	{
 		bUse64bitProcess = true;
 	}
 
 	// Setup dependencies for 32bit.
 	static const FString LightmassExecutable32 = FPaths::EngineDir() / TEXT("Binaries/Win32/UnrealLightmass.exe");
-	static const FEngineDependencyPaths RequiredDependencyPaths32 =
+	const FEngineDependencyPaths RequiredDependencyPaths32(
 	{
 		TEXT("Binaries/DotNET/SwarmInterface.dll"),
-		TEXT("Binaries/Win32/AgentInterface.dll"),
-		TEXT("Binaries/Win32/UnrealLightmass-SwarmInterface.dll"),
-		TEXT("Binaries/Win32/UnrealLightmass-ApplicationCore.dll"),
-		TEXT("Binaries/Win32/UnrealLightmass-Core.dll"),
-		TEXT("Binaries/Win32/UnrealLightmass-CoreUObject.dll"),
-		TEXT("Binaries/Win32/UnrealLightmass-DerivedDataCache.dll"),
-		TEXT("Binaries/Win32/UnrealLightmass-Sockets.dll"),
-		TEXT("Binaries/Win32/UnrealLightmass-Zen.dll"),
-		TEXT("Binaries/Win32/UnrealLightmass-Projects.dll"),
-		TEXT("Binaries/Win32/UnrealLightmass-Json.dll"),
-		TEXT("Binaries/Win32/UnrealLightmass-SSL.dll")
-		TEXT("Binaries/Win32/UnrealLightmass-BuildSettings.dll")
-	};
+	}, GetDynamicDependencyPathsFromManifest(TEXT("Binaries/Win32/")));
 
 	// Setup dependencies for 64bit.
 #if PLATFORM_WINDOWS
 	static const FString LightmassExecutable64 = FPaths::EngineDir() / TEXT("Binaries/Win64/UnrealLightmass.exe");
-	static const FEngineDependencyPaths RequiredDependencyPaths64 =
-	{
-		TEXT("Binaries/DotNET/SwarmInterface.dll"),
+	// LGPU 5.8 Begin Add block GPULightmass dependencies
+	TEXT("Binaries/DotNET/SwarmInterface.dll"),
 		TEXT("Binaries/Win64/AgentInterface.dll"),
 		TEXT("Binaries/Win64/UnrealLightmass-SwarmInterface.dll"),
 		TEXT("Binaries/Win64/UnrealLightmass-ApplicationCore.dll"),
@@ -2959,49 +3064,33 @@ bool FLightmassProcessor::BeginRun()
 		TEXT("Binaries/Win64/embree.dll"),
 		TEXT("Binaries/Win64/tbb.dll"),
 		TEXT("Binaries/Win64/tbbmalloc.dll"),
-		// @LGPU 5.3 add GPULightmassKernel
+		// @LGPU 5.6 Begin Dont forget the comma on the line above
+
 		TEXT("Binaries/Win64/GPULightmassKernel.dll")
-	};
+#endif
+		// @LGPU 5.6 End  Changed block
+
+
+
+	/* This block is commented out because the GPULightmass dependencies are now handled by UnrealLightmass.target manifest file, so we don't need to hardcode them here anymore.
+	const FEngineDependencyPaths RequiredDependencyPaths64( 
+	{ 
+		TEXT("Binaries/DotNET/SwarmInterface.dll"),
+	}, GetDynamicDependencyPathsFromManifest(TEXT("Binaries/Win64/")));
+	*/
+
 #elif PLATFORM_MAC
 	static const FString LightmassExecutable64 = FPaths::EngineDir() / TEXT("Binaries/Mac/UnrealLightmass");
-	static const FEngineDependencyPaths RequiredDependencyPaths64 =
-	{
+	const FEngineDependencyPaths RequiredDependencyPaths64( 
+	{ 
 		TEXT("Binaries/DotNET/Mac/AgentInterface.dll"),
-		TEXT("Binaries/Mac/UnrealLightmass-ApplicationCore.dylib"),
-		TEXT("Binaries/Mac/UnrealLightmass-Core.dylib"),
-		TEXT("Binaries/Mac/UnrealLightmass-CoreUObject.dylib"),
-		TEXT("Binaries/Mac/UnrealLightmass-DerivedDataCache.dylib"),
-		TEXT("Binaries/Mac/UnrealLightmass-Sockets.dylib"),
-		TEXT("Binaries/Mac/UnrealLightmass-Zen.dylib"),
-		TEXT("Binaries/Mac/UnrealLightmass-Json.dylib"),
-		TEXT("Binaries/Mac/UnrealLightmass-Projects.dylib"),
-		TEXT("Binaries/Mac/UnrealLightmass-SSL.dylib"),
-		TEXT("Binaries/Mac/UnrealLightmass-SwarmInterface.dylib"),
-		TEXT("Binaries/Mac/UnrealLightmass-BuildSettings.dylib"),
-		TEXT("Binaries/Mac/libembree.2.dylib"),
-		TEXT("Binaries/Mac/libtbb.dylib"),
-		TEXT("Binaries/Mac/libtbbmalloc.dylib")
-	};
+	}, GetDynamicDependencyPathsFromManifest(TEXT("Binaries/Mac/")));
 #elif PLATFORM_LINUX
 	static const FString LightmassExecutable64 = FPaths::EngineDir() / TEXT("Binaries/Linux/UnrealLightmass");
-	static const FEngineDependencyPaths RequiredDependencyPaths64 =
-	{
+	const FEngineDependencyPaths RequiredDependencyPaths64( 
+	{ 
 		TEXT("Binaries/DotNET/Linux/AgentInterface.dll"),
-		TEXT("Binaries/Linux/libUnrealLightmass-ApplicationCore.so"),
-		TEXT("Binaries/Linux/libUnrealLightmass-Core.so"),
-		TEXT("Binaries/Linux/libUnrealLightmass-CoreUObject.so"),
-		TEXT("Binaries/Linux/libUnrealLightmass-DerivedDataCache.so"),
-		TEXT("Binaries/Linux/libUnrealLightmass-Sockets.so"),
-		TEXT("Binaries/Linux/libUnrealLightmass-Zen.so"),
-		TEXT("Binaries/Linux/libUnrealLightmass-Json.so"),
-		TEXT("Binaries/Linux/libUnrealLightmass-Projects.so"),
-		TEXT("Binaries/Linux/libUnrealLightmass-SSL.so"),
-		TEXT("Binaries/Linux/libUnrealLightmass-SwarmInterface.so"),
-		TEXT("Binaries/Linux/libUnrealLightmass-Networking.so"),
-		TEXT("Binaries/Linux/libUnrealLightmass-Messaging.so"),
-		TEXT("Binaries/Linux/libUnrealLightmass-BuildSettings.so"),
-		TEXT("Plugins/Messaging/UdpMessaging/Binaries/Linux/libUnrealLightmass-UdpMessaging.so")
-	};
+	}, GetDynamicDependencyPathsFromManifest(TEXT("Binaries/Linux/")));
 #else // PLATFORM_LINUX
 #error "Unknown Lightmass platform"
 #endif
@@ -3014,9 +3103,13 @@ bool FLightmassProcessor::BeginRun()
 
 	const FEngineDependencyPaths OptionalDependencyPaths64 =
 	{
-		// @LGPU 5.3 add Binaries/DotNET/ProgressReporter.exe
 		TEXT("Binaries/Win64/UnrealLightmass.pdb"),
+		// @LGPU 5.8 Begin Add block ProgressReporter.exe
+	#if false // @LGPU 5.8 set true for original 5.8
+	#else
 		TEXT("Binaries/DotNET/ProgressReporter.exe")
+	#endif
+	// @LGPU 5.8 End block
 	};
 
 	// Set up the description for the Job
@@ -3052,7 +3145,7 @@ bool FLightmassProcessor::BeginRun()
 	
 	Statistics.SwarmJobOpenTime += FPlatformTime::Seconds() - SwarmJobStartTime;
 	
-	UE_LOG(LogLightmassSolver, Log,  TEXT("Swarm launching: %s %s"), bUse64bitProcess ? *LightmassExecutable64 : *LightmassExecutable32, *Exporter->SceneGuid.ToString() );
+	UE_LOGF(LogLightmassSolver, Log,  "Swarm launching: %ls %ls", bUse64bitProcess ? *LightmassExecutable64 : *LightmassExecutable32, *Exporter->SceneGuid.ToString() );
 
 	SwarmJobStartTime = FPlatformTime::Seconds();
 
@@ -3065,8 +3158,8 @@ bool FLightmassProcessor::BeginRun()
 	int32 JobFlags = NSwarm::JOB_FLAG_USE_DEFAULTS;
 	if (GLightmassDebugOptions.bDebugMode)
 	{
-		UE_LOG(LogLightmassSolver, Log,  TEXT("Waiting for UnrealLightmass.exe to be launched manually...") );
-		UE_LOG(LogLightmassSolver, Log,  TEXT("Note: This Job will not be distributed") );
+		UE_LOGF(LogLightmassSolver, Log,  "Waiting for UnrealLightmass.exe to be launched manually..." );
+		UE_LOGF(LogLightmassSolver, Log,  "Note: This Job will not be distributed" );
 		JobFlags |= NSwarm::JOB_FLAG_MANUAL_START;
 	}
 	else
@@ -3074,12 +3167,12 @@ bool FLightmassProcessor::BeginRun()
 		// Enable Swarm Job distribution, if requested
 		if (GSwarmDebugOptions.bDistributionEnabled)
 		{
-			UE_LOG(LogLightmassSolver, Log,  TEXT("Swarm will be allowed to distribute this job") );
+			UE_LOGF(LogLightmassSolver, Log,  "Swarm will be allowed to distribute this job" );
 			JobFlags |= NSwarm::JOB_FLAG_ALLOW_REMOTE;
 		}
 		else
 		{
-			UE_LOG(LogLightmassSolver, Log,  TEXT("Swarm will be not be allowed to distribute this job; it will run locally only") );
+			UE_LOGF(LogLightmassSolver, Log,  "Swarm will be not be allowed to distribute this job; it will run locally only" );
 		}
 	}
 
@@ -3088,7 +3181,7 @@ bool FLightmassProcessor::BeginRun()
 	GConfig->GetBool(TEXT("LightingBuildOptions"), TEXT("MinimizeSwarm"), bMinimizeSwarm, GEditorSettingsIni);
 	if ( bMinimizeSwarm )
 	{
-		UE_LOG(LogLightmassSolver, Log,  TEXT("Swarm will be run minimized") );
+		UE_LOGF(LogLightmassSolver, Log,  "Swarm will be run minimized" );
 		JobFlags |= NSwarm::JOB_FLAG_MINIMIZED;
 	}
 
@@ -3114,7 +3207,7 @@ bool FLightmassProcessor::BeginRun()
 	int32 ErrorCode = Swarm.BeginJobSpecification( JobSpecification32, JobSpecification64 );
 	if( ErrorCode < 0 )
 	{
-		UE_LOG(LogLightmassSolver, Log,  TEXT("Error, BeginJobSpecification failed with error code %d"), ErrorCode );
+		UE_LOGF(LogLightmassSolver, Log,  "Error, BeginJobSpecification failed with error code %d", ErrorCode );
 		bProcessingFailed = true;
 	}
 
@@ -3135,7 +3228,7 @@ bool FLightmassProcessor::BeginRun()
 			}
 			else
 			{
-				UE_LOG(LogLightmassSolver, Log,  TEXT("Error, AddTask failed with error code %d"), ErrorCode );
+				UE_LOGF(LogLightmassSolver, Log,  "Error, AddTask failed with error code %d", ErrorCode );
 			}
 		}
 	}
@@ -3152,13 +3245,16 @@ bool FLightmassProcessor::BeginRun()
 				//@todo - accurately estimate cost
 				NewTaskSpecification.Cost = 10000;
 				ErrorCode = Swarm.AddTask( NewTaskSpecification );
+
+				UE_LOGF(LogLightmassSolver, Verbose, "AddTask VLM %ls", *It.Key().ToString() );
+
 				if( ErrorCode >= 0 )
 				{
 					NumTotalSwarmTasks++;
 				}
 				else
 				{
-					UE_LOG(LogLightmassSolver, Warning,  TEXT("Error, AddTask failed with error code %d"), ErrorCode );
+					UE_LOGF(LogLightmassSolver, Warning,  "Error, AddTask failed with error code %d", ErrorCode );
 					bProcessingFailed = true;
 				}
 			}
@@ -3177,7 +3273,7 @@ bool FLightmassProcessor::BeginRun()
 			}
 			else
 			{
-				UE_LOG(LogLightmassSolver, Warning,  TEXT("Error, AddTask failed with error code %d"), ErrorCode );
+				UE_LOGF(LogLightmassSolver, Warning,  "Error, AddTask failed with error code %d", ErrorCode );
 				bProcessingFailed = true;
 			}
 		}
@@ -3186,13 +3282,15 @@ bool FLightmassProcessor::BeginRun()
 			NSwarm::FTaskSpecification NewTaskSpecification( Lightmass::MeshAreaLightDataGuid, TEXT("MeshAreaLightData"), NSwarm::JOB_TASK_FLAG_USE_DEFAULTS );
 			NewTaskSpecification.Cost = 1000;
 			ErrorCode = Swarm.AddTask( NewTaskSpecification );
+			UE_LOGF(LogLightmassSolver, Verbose, "AddTask MeshAreasLights %ls", *Lightmass::MeshAreaLightDataGuid.ToString());
+
 			if( ErrorCode >= 0 )
 			{
 				NumTotalSwarmTasks++;
 			}
 			else
 			{
-				UE_LOG(LogLightmassSolver, Log,  TEXT("Error, AddTask failed with error code %d"), ErrorCode );
+				UE_LOGF(LogLightmassSolver, Log,  "Error, AddTask failed with error code %d", ErrorCode );
 				bProcessingFailed = true;
 			}
 		}
@@ -3240,7 +3338,7 @@ bool FLightmassProcessor::BeginRun()
 				}
 				else
 				{
-					UE_LOG(LogLightmassSolver, Log,  TEXT("Error, AddTask failed with error code %d"), ErrorCode );
+					UE_LOGF(LogLightmassSolver, Log,  "Error, AddTask failed with error code %d", ErrorCode );
 				}
 			}
 		}
@@ -3256,13 +3354,16 @@ bool FLightmassProcessor::BeginRun()
 				NSwarm::FTaskSpecification NewTaskSpecification( SMTextureMapping->GetLightingGuid(), TEXT("SMTextureMapping"), NSwarm::JOB_TASK_FLAG_USE_DEFAULTS );
 				NewTaskSpecification.Cost = SMTextureMapping->GetTexelCount();
 				ErrorCode = Swarm.AddTask( NewTaskSpecification );
+
+				UE_LOGF(LogLightmassSolver, Verbose, "AddTask Mapping %ls", *SMTextureMapping->GetLightingGuid().ToString());
+
 				if( ErrorCode >= 0 )
 				{
 					NumTotalSwarmTasks++;
 				}
 				else
 				{
-					UE_LOG(LogLightmassSolver, Log,  TEXT("Error, AddTask failed with error code %d"), ErrorCode );
+					UE_LOGF(LogLightmassSolver, Log,  "Error, AddTask failed with error code %d", ErrorCode );
 				}
 			}
 		}
@@ -3278,13 +3379,16 @@ bool FLightmassProcessor::BeginRun()
 				NSwarm::FTaskSpecification NewTaskSpecification( LandscapeMapping->GetLightingGuid(), TEXT("LandscapeMapping"), NSwarm::JOB_TASK_FLAG_USE_DEFAULTS );
 				NewTaskSpecification.Cost = LandscapeMapping->GetTexelCount();
 				ErrorCode = Swarm.AddTask( NewTaskSpecification );
+
+				UE_LOGF(LogLightmassSolver, Verbose, "AddTask Landscape Mapping %ls", *LandscapeMapping->GetLightingGuid().ToString());
+
 				if( ErrorCode >= 0 )
 				{
 					NumTotalSwarmTasks++;
 				}
 				else
 				{
-					UE_LOG(LogLightmassSolver, Log,  TEXT("Error, AddTask failed with error code %d"), ErrorCode );
+					UE_LOGF(LogLightmassSolver, Log,  "Error, AddTask failed with error code %d", ErrorCode );
 				}
 			}
 		}
@@ -3293,7 +3397,7 @@ bool FLightmassProcessor::BeginRun()
 	int32 EndJobErrorCode = Swarm.EndJobSpecification();
 	if( EndJobErrorCode < 0 )
 	{
-		UE_LOG(LogLightmassSolver, Log,  TEXT("Error, EndJobSpecification failed with error code %d"), ErrorCode );
+		UE_LOGF(LogLightmassSolver, Log,  "Error, EndJobSpecification failed with error code %d", ErrorCode );
 	}
 
 	if ( ErrorCode < 0 || EndJobErrorCode < 0 )
@@ -3374,6 +3478,106 @@ bool FLightmassProcessor::Update()
 	return bIsFinished;
 }
 
+void FLightmassProcessor::ImportDeferredMappings()
+{
+	TArray<FString> Files;
+	IFileManager::Get().FindFiles(Files, *DeferredMappingsDirectory, TEXT(".lm"));
+
+	DeferredMappings = new FDeferredMappingsBundle;
+	
+	// load the mappings
+	for(const FString& FileName : Files)
+	{
+		TArray<uint8> FileData;
+		int32 BaseMappingIndex  = DeferredMappings->Mappings.Num();
+		FString FullFileName = FString::Printf(TEXT("%s\\%s"), *DeferredMappingsDirectory, *FileName);
+
+		if (FFileHelper::LoadFileToArray(FileData, *FullFileName))
+		{
+			FObjectMemoryReader Reader(FileData);
+		
+			FDeferredMappingsBundle Bundle;
+			Bundle.Serialize(Reader, false);
+
+			for (FLightmassProcessor::FTextureMappingImportHelper& Mapping : Bundle.Mappings)
+			{
+				// Those mapping guid are just numbered 0 to n, so we rebase them to be unique in the combined mappings
+				Mapping.MappingGuid.D += BaseMappingIndex;
+			}
+
+			// transfer all bundle mappings
+			DeferredMappings->Mappings.Append(Bundle.Mappings);
+		}
+		else
+		{
+			UE_LOGF(LogLightmassSolver, Warning, "Error, couldn't import deferred mapping %ls", *FullFileName);
+			bProcessingFailed = true;
+		}
+	}
+
+	DeferredMappings->MapHelpers();
+
+	for (FLightmassProcessor::FTextureMappingImportHelper& Mapping : DeferredMappings->Mappings)
+	{
+		ImportedMappings.Add(Mapping.MappingGuid, &Mapping);
+	}	
+}
+
+void FLightmassProcessor::ClearImportedDeferredMappings()
+{
+	if (DeferredMappings)
+	{
+		for (FLightmassProcessor::FTextureMappingImportHelper& Mapping : DeferredMappings->Mappings)
+		{
+			ImportedMappings.Remove(Mapping.MappingGuid);
+		}
+	}
+}
+
+
+void FLightmassProcessor::ExportDeferredMappings()
+{
+	if (DeferredMappings && !System.Options.bApplyDeferedActorMappingPass)
+	{		
+		FGuid BundleGuid = FGuid::NewGuid();
+
+		FString FileName = FString::Printf(TEXT("Mappings_%s.lm"), *BundleGuid.ToString());
+
+		TArray<uint8> FileData;
+		FObjectMemoryWriter Writer(FileData);
+
+		DeferredMappings->Serialize(Writer, false);
+
+		FString FullFileName = FString::Printf(TEXT("%s\\%s"), *DeferredMappingsDirectory, *FileName);
+
+		if (!FFileHelper::SaveArrayToFile(FileData, *FullFileName))
+		{
+			UE_LOGF(LogLightmassSolver, Warning, "Error, couldn't export deferred mapping %ls", *FullFileName);
+			bProcessingFailed = true;
+		}
+	}
+}
+
+bool FLightmassProcessor::IsDeferredMapping(const FGuid& Guid)
+{
+	if (const FStaticLightingMapping* Mapping = Exporter->FindMappingByGuid(Guid))
+	{
+		return Mapping->IsDeferred();
+	}
+	return false;
+}
+
+void FLightmassProcessor::DeferMapping(FTextureMappingImportHelper* ImportHelper)
+{
+	if (!DeferredMappings)
+	{
+		DeferredMappings = new FDeferredMappingsBundle();
+	}
+
+ 	DeferredMappings->Mappings.Add(*ImportHelper);
+	DeferredMappings->OwnerToMapping.Add(ImportHelper->OwnerGuid, ImportHelper->MappingGuid);
+}
+
 bool FLightmassProcessor::CompleteRun()
 {
 	bRunningLightmass = false;
@@ -3396,6 +3600,11 @@ bool FLightmassProcessor::CompleteRun()
 
 		if (bImportCompletedMappingsImmediately)
 		{
+			if (System.Options.bApplyDeferedActorMappingPass)
+			{
+				ImportDeferredMappings();
+			}
+
 			// Import any outstanding completed mappings.
 			ImportMappings(false);
 
@@ -3409,6 +3618,9 @@ bool FLightmassProcessor::CompleteRun()
 
 				ProcessAvailableMappings();
 			}
+
+			// Export mapping which we'll not process on this run (this will remove then from available mappings)
+			ExportDeferredMappings();
 		}
 
 		ApplyPrecomputedVisibility();
@@ -3417,6 +3629,8 @@ bool FLightmassProcessor::CompleteRun()
 	CompletedMappingTasks.Clear();
 	CompletedVisibilityTasks.Clear();
 	CompletedVolumetricLightmapTasks.Clear();
+
+	ClearImportedDeferredMappings();
 
 	double ApplyTimeDelta = Statistics.ApplyTimeInProcessing - OriginalApplyTime;
 	Statistics.ImportTimeInProcessing += FPlatformTime::Seconds() - ImportStartTime - ApplyTimeDelta;
@@ -3500,13 +3714,12 @@ void FLightmassProcessor::ImportVolumeSamples()
 				Swarm.ReadChannel(Channel, &LevelGuid, sizeof(LevelGuid));
 				TArray<Lightmass::FVolumeLightingSampleData> VolumeSamples;
 				ReadArray(Channel, VolumeSamples);
-				ULevel* CurrentLevel = FindLevel(LevelGuid);
+				ULevel* CurrentLevel = System.LightingContext.GetLevelForGuid(LevelGuid).Get();
 
 				// Only build precomputed light for visible streamed levels
 				if (CurrentLevel && CurrentLevel->bIsVisible)
 				{
-					ULevel* CurrentStorageLevel = System.LightingScenario ? System.LightingScenario : CurrentLevel;
-					UMapBuildDataRegistry* CurrentRegistry = CurrentStorageLevel->GetOrCreateMapBuildData();
+					UMapBuildDataRegistry* CurrentRegistry = System.LightingContext.GetOrCreateRegistryForLevel(CurrentLevel);
 					FPrecomputedLightVolumeData& CurrentLevelData = CurrentRegistry->AllocateLevelPrecomputedLightVolumeBuildData(CurrentLevel->LevelBuildDataId);
 
 					FBox3f LevelVolumeBounds(ForceInit);
@@ -3562,7 +3775,7 @@ void FLightmassProcessor::ImportVolumeSamples()
 		}
 		else
 		{
-			UE_LOG(LogLightmassSolver, Log,  TEXT("Error, OpenChannel failed to open %s with error code %d"), *ChannelName, Channel );
+			UE_LOGF(LogLightmassSolver, Log,  "Error, OpenChannel failed to open %ls with error code %d", *ChannelName, Channel );
 		}
 		FPlatformAtomics::InterlockedExchange(&VolumeSampleTaskCompleted, 0);
 	}
@@ -3629,7 +3842,7 @@ void FLightmassProcessor::ImportPrecomputedVisibility()
 		}
 		else
 		{
-			UE_LOG(LogLightmassSolver, Log,  TEXT("Error, OpenChannel failed to open %s with error code %d"), *ChannelName, Channel );
+			UE_LOGF(LogLightmassSolver, Log,  "Error, OpenChannel failed to open %ls with error code %d", *ChannelName, Channel );
 		}
 
 		delete Element;
@@ -3914,7 +4127,7 @@ void FLightmassProcessor::ApplyPrecomputedVisibility()
 
 		System.GetWorld()->PersistentLevel->PrecomputedVisibilityHandler.UpdateVisibilityStats(true);
 
-		UE_LOG(LogStaticLightingSystem, Log, TEXT("ApplyPrecomputedVisibility %.1fs with %u cells, %.1f%% of all queries changed to visible from spreading neighbors, compressed %.3fMb to %.3fMb (%.1f ratio)"),
+		UE_LOGF(LogStaticLightingSystem, Log, "ApplyPrecomputedVisibility %.1fs with %u cells, %.1f%% of all queries changed to visible from spreading neighbors, compressed %.3fMb to %.3fMb (%.1f ratio)",
 			FPlatformTime::Seconds() - StartTime,
 			CombinedPrecomputedVisibilityCells.Num(),
 			100.0f * QueriesVisibleFromSpreadingNeighbors / TotalNumQueries,
@@ -3943,7 +4156,7 @@ void FLightmassProcessor::ImportMeshAreaLightData()
 			{
 				Lightmass::FMeshAreaLightData LMCurrentLightData;
 				Swarm.ReadChannel(Channel, &LMCurrentLightData, sizeof(LMCurrentLightData));
-				const ULevel* CurrentLevel = FindLevel(LMCurrentLightData.LevelGuid);
+				const ULevel* CurrentLevel = System.LightingContext.GetLevelForGuid(LMCurrentLightData.LevelGuid).Get();
 				if (CurrentLevel && CurrentLevel->Actors.Num() > 0)
 				{
 					// Find the level that the mesh area light was in
@@ -3970,7 +4183,7 @@ void FLightmassProcessor::ImportMeshAreaLightData()
 		}
 		else
 		{
-			UE_LOG(LogLightmassSolver, Log,  TEXT("Error, OpenChannel failed to open %s with error code %d"), *ChannelName, Channel );
+			UE_LOGF(LogLightmassSolver, Log,  "Error, OpenChannel failed to open %ls with error code %d", *ChannelName, Channel );
 		}
 		FPlatformAtomics::InterlockedExchange(&MeshAreaLightDataTaskCompleted, 0);
 	}
@@ -4004,7 +4217,7 @@ void FLightmassProcessor::ImportVolumeDistanceFieldData()
 		}
 		else
 		{
-			UE_LOG(LogLightmassSolver, Log,  TEXT("Error, OpenChannel failed to open %s with error code %d"), *ChannelName, Channel );
+			UE_LOGF(LogLightmassSolver, Log,  "Error, OpenChannel failed to open %ls with error code %d", *ChannelName, Channel );
 		}
 		FPlatformAtomics::InterlockedExchange(&VolumeDistanceFieldTaskCompleted, 0);
 	}
@@ -4066,17 +4279,17 @@ void FLightmassProcessor::ImportStaticLightingTextureMapping( const FGuid& Mappi
 				FMappingImportHelper** pImportData = ImportedMappings.Find( NextMappingGuid );
 				check( pImportData && *pImportData && (*pImportData)->Type == SLT_Texture );
 				FTextureMappingImportHelper* pTextureImportData = (*pImportData)->GetTextureMappingHelper();
-				TextureMapping = pTextureImportData->TextureMapping;
+				TextureMapping = pTextureImportData->TextureMapping.GetReference();
 				bReimporting = true;
 				if ( GLightmassStatsMode )
 				{
-					UE_LOG(LogLightmassSolver, Log, TEXT("Re-importing texture mapping: %s"), *NextMappingGuid.ToString());
+					UE_LOGF(LogLightmassSolver, Log, "Re-importing texture mapping: %ls", *NextMappingGuid.ToString());
 				}
 			}
 
 			if( ensureMsgf( (TextureMapping != NULL), TEXT("Opened mapping channel %s to Swarm, then tried to find texture mapping %s (number %d of %d) and failed."), *MappingGuid.ToString(), *NextMappingGuid.ToString(), MappingsImported, NumMappings) )
 			{
-				//UE_LOG(LogLightmassSolver, Log, TEXT("Importing %32s %s"), *(TextureMapping->GetDescription()), *(TextureMapping->GetLightingGuid().ToString()));
+				//UE_LOGF(LogLightmassSolver, Log, "Importing %32ls %ls", *(TextureMapping->GetDescription()), *(TextureMapping->GetLightingGuid().ToString()));
 
 				FTextureMappingImportHelper* ImportData = new FTextureMappingImportHelper();
 				ImportData->TextureMapping = TextureMapping;
@@ -4094,7 +4307,7 @@ void FLightmassProcessor::ImportStaticLightingTextureMapping( const FGuid& Mappi
 				}
 				else
 				{
-					UE_LOG(LogLightmassSolver, Warning, TEXT("Failed to import TEXTure mapping results!"));
+					UE_LOGF(LogLightmassSolver, Warning, "Failed to import TEXTure mapping results!");
 				}
 
 				// Completed this mapping, increment
@@ -4131,7 +4344,7 @@ void FLightmassProcessor::ImportStaticLightingTextureMapping( const FGuid& Mappi
 	// Other error
 	else
 	{
-		UE_LOG(LogLightmassSolver, Log,  TEXT("Error, OpenChannel failed to open %s with error code %d"), *ChannelName, Channel );
+		UE_LOGF(LogLightmassSolver, Log,  "Error, OpenChannel failed to open %ls with error code %d", *ChannelName, Channel );
 	}
 }
 
@@ -4189,8 +4402,7 @@ void FLightmassProcessor::ImportStaticShadowDepthMap(ULightComponent* Light)
 	const int32 Channel = Swarm.OpenChannel( *ChannelName, LM_DOMINANTSHADOW_CHANNEL_FLAGS );
 	if (Channel >= 0)
 	{
-		ULevel* CurrentStorageLevel = System.LightingScenario ? System.LightingScenario : Light->GetOwner()->GetLevel();
-		UMapBuildDataRegistry* CurrentRegistry = CurrentStorageLevel->GetOrCreateMapBuildData();
+		UMapBuildDataRegistry* CurrentRegistry = System.LightingContext.GetOrCreateRegistryForActor(Light->GetOwner());
 		FLightComponentMapBuildData& CurrentLightData = CurrentRegistry->FindOrAllocateLightBuildData(Light->LightGuid, true);
 
 		Lightmass::FStaticShadowDepthMapData ShadowMapData;
@@ -4210,7 +4422,7 @@ void FLightmassProcessor::ImportStaticShadowDepthMap(ULightComponent* Light)
 	}
 	else
 	{
-		UE_LOG(LogLightmassSolver, Log,  TEXT("Error, OpenChannel failed to open %s with error code %d"), *ChannelName, Channel );
+		UE_LOGF(LogLightmassSolver, Log,  "Error, OpenChannel failed to open %ls with error code %d", *ChannelName, Channel );
 	}
 }
 
@@ -4242,7 +4454,7 @@ void FLightmassProcessor::ImportMapping( const FGuid& MappingGuid, bool bProcess
 			FMappingImportHelper** pImportData = ImportedMappings.Find(MappingGuid);
 			if ((pImportData == NULL) || (*pImportData == NULL))
 			{
-				UE_LOG(LogLightmassSolver, Warning, TEXT("Mapping not found for %s"), *(MappingGuid.ToString()));
+				UE_LOGF(LogLightmassSolver, Warning, "Mapping not found for %ls", *(MappingGuid.ToString()));
 			}
 		}
 	}
@@ -4276,18 +4488,18 @@ void FLightmassProcessor::ProcessMapping( const FGuid& MappingGuid )
 					FTextureMappingImportHelper* TImportData = (FTextureMappingImportHelper*)ImportData;
 					if(TImportData->TextureMapping)
 					{
-						//UE_LOG(LogLightmassSolver, Log, TEXT("Processing %32s: %s"), *(TImportData->TextureMapping->GetDescription()), *(TImportData->TextureMapping->GetLightingGuid().ToString()));
+						//UE_LOGF(LogLightmassSolver, Log, "Processing %32ls: %ls", *(TImportData->TextureMapping->GetDescription()), *(TImportData->TextureMapping->GetLightingGuid().ToString()));
 						System.ApplyMapping(TImportData->TextureMapping, TImportData->QuantizedData, TImportData->ShadowMapData);
 					}
 					else
 					{
-						//UE_LOG(LogLightmassSolver, Log, TEXT("Processing texture mapping %s failed due to missing mapping!"), *MappingGuid.ToString());
+						//UE_LOGF(LogLightmassSolver, Log, "Processing texture mapping %ls failed due to missing mapping!", *MappingGuid.ToString());
 					}
 				}
 				break;
 			default:
 				{
-					UE_LOG(LogLightmassSolver, Warning, TEXT("Unknown mapping type in the ImportedMappings: 0x%08x"), (uint32)(ImportData->Type));
+					UE_LOGF(LogLightmassSolver, Warning, "Unknown mapping type in the ImportedMappings: 0x%08x", (uint32)(ImportData->Type));
 				}
 			}
 
@@ -4301,7 +4513,7 @@ void FLightmassProcessor::ProcessMapping( const FGuid& MappingGuid )
 	}
 	else
 	{
-		UE_LOG(LogLightmassSolver, Warning, TEXT("Failed to find imported mapping %s"), *(MappingGuid.ToString()));
+		UE_LOGF(LogLightmassSolver, Warning, "Failed to find imported mapping %ls", *(MappingGuid.ToString()));
 	}
 
 	if ( !bRunningLightmass )
@@ -4326,7 +4538,14 @@ void FLightmassProcessor::ProcessAvailableMappings()
 		{
 			if ( *pImportData && (*pImportData)->bProcessed == false )
 			{
-				ProcessMapping(NextGuid);
+				if (IsDeferredMapping(NextGuid))
+				{
+					DeferMapping((*pImportData)->GetTextureMappingHelper());
+				}
+				else
+				{
+					ProcessMapping(NextGuid);
+				}
 			}
 			ProcessedCount++;
 		}
@@ -4357,7 +4576,7 @@ void FLightmassProcessor::ImportDebugOutputStruct(int32 Channel)
 	{
 		if (GDebugStaticLightingInfo.bValid)
 		{
-			UE_LOG(LogLightmassSolver, Log, TEXT("Error, importing valid debug info, but GDebugStaticLightingInfo was already valid (multiple sources of debug info from Lightmass)"));
+			UE_LOGF(LogLightmassSolver, Log, "Error, importing valid debug info, but GDebugStaticLightingInfo was already valid (multiple sources of debug info from Lightmass)");
 		}
 
 		GDebugStaticLightingInfo.bValid = true;
@@ -4471,8 +4690,8 @@ ULevel* FLightmassProcessor::FindLevel(const FGuid& Guid)
 {
 	if (Exporter)
 	{
-		const TWeakObjectPtr<ULevel>* Level = Exporter->LevelGuids.Find(Guid);
-		return Level && Level->IsValid() ? Level->Get() : NULL;
+		const TWeakObjectPtr<ULevel> Level = Exporter->LightingContext.GetLevelForGuid(Guid);
+		return Level.IsValid() ? Level.Get() : NULL;
 	}
 	return NULL;
 }
@@ -4529,7 +4748,7 @@ bool FLightmassProcessor::ImportSignedDistanceFieldShadowMapData2D(int32 Channel
 		ULightComponent* LightComp = FindLight(LightGuid);
 		if (LightComp == NULL)
 		{
-			UE_LOG(LogLightmassSolver, Warning, TEXT("Failed to find light for texture mapping: %s"), *LightGuid.ToString());
+			UE_LOGF(LogLightmassSolver, Warning, "Failed to find light for texture mapping: %ls", *LightGuid.ToString());
 		}
 
 		Lightmass::FShadowMapData2DData SMData(0,0);
@@ -4661,12 +4880,126 @@ bool FLightmassProcessor::ImportTextureMapping(int32 Channel, FTextureMappingImp
 	int32 WastedMemory = FMath::TruncToInt(MemoryAmount * BytesPerPixel * MIP_FACTOR * LightMapTypeModifier);
 	int32 TotalMemory = FMath::TruncToInt(TotalMemoryAmount * BytesPerPixel * MIP_FACTOR * LightMapTypeModifier);
 	
-	FStatsViewerModule& StatsViewerModule = FModuleManager::Get().LoadModuleChecked<FStatsViewerModule>(TEXT("StatsViewer"));
-	ULightingBuildInfo* LightingBuildInfo = NewObject<ULightingBuildInfo>();
-	LightingBuildInfo->Set( MappedObject, TMImport.ExecutionTime, TMImport.UnmappedTexelsPercentage, WastedMemory, TotalMemory );
-	StatsViewerModule.GetPage(EStatsPage::LightingBuildInfo)->AddEntry( LightingBuildInfo );
+	// Lighting build info entry is constructed inside the StatsViewer module (avoids a hard dependency on StatsViewer).
+			FModuleManager::Get().LoadModule(TEXT("StatsViewer"));
+		if (IStatsViewerProvider* StatsProvider = GetStatsViewerProvider())
+		{
+			StatsProvider->AddLightingBuildInfoEntry( MappedObject, TMImport.ExecutionTime, TMImport.UnmappedTexelsPercentage, WastedMemory, TotalMemory );
+		}
 
 	return bResult;
+}
+
+void FLightmassProcessor::FMappingImportHelper::Serialize(FArchive& Ar)
+{
+	static_assert(sizeof(Type) == sizeof(int32));
+	Ar << (int32&)Type;
+	Ar << MappingGuid;
+	Ar << OwnerGuid;
+	Ar << ExecutionTime;
+	Ar << bProcessed;
+}
+
+void FLightmassProcessor::FTextureMappingImportHelper::Serialize(FArchive& Ar)
+{
+	FMappingImportHelper::Serialize(Ar);
+
+	if (Ar.IsLoading())
+	{
+		int32 MappingType;
+		Ar << MappingType;
+		
+		switch (MappingType)
+		{
+			case 0:
+				TextureMapping = new FStaticMeshStaticLightingTextureMapping(Ar);
+				break;
+			case 1:
+				TextureMapping = new FLandscapeStaticLightingTextureMapping(Ar);
+				break;			
+			case 2:
+				TextureMapping = new FStaticLightingTextureMapping_InstancedStaticMesh(Ar);
+		}
+		
+		// Ptr will be deleted during FStaticLightingTextureMapping::Apply
+		QuantizedData = new FQuantizedLightmapData;
+	}
+	else
+	{
+		static  TMap<FString, int32> DescToType = {{"SMTextureMapping", 0}, { "LandscapeMapping", 1 }, {"InstancedSMLightingMapping", 2}};
+		
+		int32  mappingType = DescToType.FindChecked(TextureMapping->GetDescription());
+		Ar << mappingType;
+	}
+
+	TextureMapping->Serialize(Ar);
+	QuantizedData->Serialize(Ar);
+	
+	Ar << UnmappedTexelsPercentage;
+	Ar << NumShadowMaps;
+	Ar << NumSignedDistanceFieldShadowMaps;
+
+	int32 NbShadowMapData = ShadowMapData.Num();
+	Ar << NbShadowMapData;
+
+	if (Ar.IsLoading())
+	{
+		for (int32 i = 0; i < NbShadowMapData; i++)
+		{
+			FSoftObjectPath	Path;
+			Ar << Path;
+
+			int32 ShadowMapType;
+			Ar << ShadowMapType;
+
+			int32 SizeX;
+			int32 SizeY;
+			Ar << SizeX;
+			Ar << SizeY;
+
+			// Ptr will be deleted during FStaticLightingTextureMapping::Apply
+			FShadowMapData2D* Data = nullptr;
+
+			switch ((FShadowMapData2D::ShadowMapDataType)ShadowMapType)
+			{
+				case FShadowMapData2D::SHADOW_SIGNED_DISTANCE_FIELD_DATA:
+					Data = new FShadowSignedDistanceFieldData2D(SizeX, SizeY);
+					break;
+				case FShadowMapData2D::SHADOW_SIGNED_DISTANCE_FIELD_DATA_QUANTIZED:
+					Data = new FQuantizedShadowSignedDistanceFieldData2D(SizeX, SizeY);
+					break;
+
+				default:
+				case FShadowMapData2D::SHADOW_FACTOR_DATA:
+				case FShadowMapData2D::SHADOW_FACTOR_DATA_QUANTIZED:
+					ensure(false);
+					return;
+			}
+
+			Data->Serialize(&Ar);
+
+			ShadowMapData.Add(Cast<ULightComponent>(Path.ResolveObject()), Data);
+		}
+	}
+	else
+	{
+		for (auto& it : ShadowMapData)
+		{
+			FSoftObjectPath Path(it.Key);
+			Ar << Path;
+
+			int32 ShadowMapType = (int32)it.Value->GetType();
+			Ar << ShadowMapType;
+
+			int32 SizeX = it.Value->GetSizeX();
+			int32 SizeY = it.Value->GetSizeY();
+			Ar << SizeX;
+			Ar << SizeY;
+
+			it.Value->Serialize(&Ar);
+		}
+
+	}	
 }
 
 #undef LOCTEXT_NAMESPACE
